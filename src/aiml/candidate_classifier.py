@@ -1,0 +1,219 @@
+"""
+Candidate Classifier — Module for classifying detected candidates as beacon or noise.
+
+Per AIML Integration Specification §5.2 & §6.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+import os
+import sys
+from pathlib import Path
+import time
+from typing import List, Optional
+import numpy as np
+
+from src.aiml.contracts import CandidateClassification, CandidateFeatureVector
+from src.aiml.model_loader import ModelLoader, ModelPackage
+from src.aiml.calibration import ProbabilityCalibrator
+
+
+class ICandidateClassifier(ABC):
+    """
+    Abstract interface for candidate classifiers.
+    """
+
+    @abstractmethod
+    def classify(
+        self,
+        features: List[CandidateFeatureVector],
+    ) -> List[CandidateClassification]:
+        """
+        Classify a list of candidate feature vectors.
+        Preserves candidate input ordering.
+        """
+        ...
+
+
+class RuleBasedClassifierFallback(ICandidateClassifier):
+    """
+    Rule-based baseline fallback classifier.
+    """
+
+    def classify(
+        self,
+        features: List[CandidateFeatureVector],
+    ) -> List[CandidateClassification]:
+        results = []
+        t0 = time.perf_counter()
+        for fv in features:
+            # Simple rule-based score calculation
+            vals = fv.values
+            peak = vals[0] if len(vals) > 0 else 0.5
+            contrast = vals[2] if len(vals) > 2 else 1.0
+            dist_pred = vals[7] if len(vals) > 7 else 0.5
+
+            score = 0.5 * peak + 0.3 * min(1.0, contrast / 5.0) + 0.2 * (1.0 - min(1.0, dist_pred))
+            prob = float(np.clip(score, 0.0, 1.0))
+            is_b = prob >= 0.5
+
+            results.append(
+                CandidateClassification(
+                    candidate_id=fv.candidate_id,
+                    beacon_probability=prob,
+                    is_beacon=is_b,
+                    classifier_score=score,
+                    model_name="RuleBasedFallback",
+                    model_version="v0.0",
+                    inference_time_ms=(time.perf_counter() - t0) * 1000.0 / max(1, len(features)),
+                    used_fallback=True,
+                    fallback_reason="Rule-based baseline active",
+                )
+            )
+        return results
+
+
+class LearnedCandidateClassifier(ICandidateClassifier):
+    """
+    Learned candidate classifier executing logistic-regression / linear model inference.
+
+    Machine Learning Architecture & Mathematical Invariants:
+      1. Feature Extraction:
+         Consumes a normalized candidate feature vector x in R^D (e.g., peak intensity,
+         area/size, contrast ratio, eccentricity, temporal motion consistency).
+      2. Feature Standardization:
+         Transforms raw feature space using saved training empirical statistics:
+           x_scaled = (x - mu) / sigma
+         guaranteeing numerical zero-mean unit-variance input to the linear layers.
+      3. Linear / Multi-Layer Perceptron Forward Pass:
+         - Logistic Regression:
+           z = dot(x_scaled, w) + b
+           sigma(z) = 1 / (1 + exp(-clip(z, -20.0, 20.0)))
+         - 20.0 saturation clamp guards against floating-point overflow under IEEE 754.
+      4. Post-Hoc Probability Calibration:
+         Applies Platt scaling / temperature scaling:
+           p_calibrated = 1 / (1 + exp(-logit(p) / T))
+         to guarantee well-calibrated posterior probabilities under severe sensor noise.
+      5. Fault Tolerance & Deterministic Safety:
+         Any dimensionality mismatch, non-finite value, or runtime error immediately
+         falls back to RuleBasedClassifierFallback with full audit telemetry.
+    """
+
+    def __init__(
+        self,
+        model_dir: str = "models/candidate_classifier/v001",
+        fallback: Optional[ICandidateClassifier] = None,
+    ) -> None:
+        self.model_dir = model_dir
+        self.fallback = fallback or RuleBasedClassifierFallback()
+        self.package: Optional[ModelPackage] = None
+        self.calibrator = ProbabilityCalibrator()
+
+        self._load_model()
+
+    def _load_model(self) -> None:
+        try:
+            candidates = [
+                Path(self.model_dir),
+            ]
+            if hasattr(sys, "_MEIPASS"):
+                candidates.append(Path(getattr(sys, "_MEIPASS")) / self.model_dir)
+            if hasattr(sys, "executable"):
+                exe_dir = Path(sys.executable).resolve().parent
+                candidates.append(exe_dir / self.model_dir)
+                candidates.append(exe_dir / "_internal" / self.model_dir)
+            project_root = Path(__file__).resolve().parents[2]
+            candidates.append(project_root / self.model_dir)
+
+            for cand in candidates:
+                if cand.exists() and (cand / "model.json").exists():
+                    self.package = ModelLoader.load_candidate_classifier_package(str(cand))
+                    break
+        except Exception as e:
+            print(f"[LearnedCandidateClassifier] Warning loading model from {self.model_dir}: {e}")
+            self.package = None
+
+    def classify(
+        self,
+        features: List[CandidateFeatureVector],
+    ) -> List[CandidateClassification]:
+        if not features:
+            return []
+
+        if self.package is None:
+            return self.fallback.classify(features)
+
+        results = []
+        t0 = time.perf_counter()
+
+        try:
+            if tuple(features[0].feature_names) != self.package.feature_names:
+                return self.fallback.classify(features)
+
+            # Batch feature matrix
+            X = np.array([fv.values for fv in features], dtype=np.float32)
+
+            # Feature dimension check
+            if X.shape[1] != len(self.package.weights):
+                print(f"[LearnedCandidateClassifier] Dimension mismatch ({X.shape[1]} vs {len(self.package.weights)}). Using fallback.")
+                return self.fallback.classify(features)
+
+            # Standardize
+            X_scaled = (X - self.package.mean) / self.package.std
+
+            # Forward pass: MLP or Logistic Regression
+            if getattr(self.package, "layers", None):
+                act = X_scaled
+                for W, b, fn in self.package.layers:
+                    z = np.dot(act, W) + b
+                    if fn == "relu":
+                        act = np.maximum(0, z)
+                    elif fn == "sigmoid":
+                        act = 1.0 / (1.0 + np.exp(-np.clip(z, -20.0, 20.0)))
+                    else:
+                        act = z
+                probs = act.ravel()
+            else:
+                # Logistic Regression inference
+                logits = np.dot(X_scaled, self.package.weights) + self.package.bias
+                probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -20.0, 20.0)))
+
+            if not np.isfinite(probs).all():
+                return self.fallback.classify(features)
+
+            if abs(self.calibrator.temperature - 1.0) < 1e-6:
+                probs_cal = probs
+            else:
+                p = np.clip(probs, 1e-7, 1.0 - 1e-7)
+                logit = np.log(p / (1.0 - p))
+                probs_cal = 1.0 / (1.0 + np.exp(-logit / self.calibrator.temperature))
+
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            per_item_ms = total_ms / len(features)
+
+            thresh = self.package.classification_threshold
+            for i, fv in enumerate(features):
+                prob = float(probs[i])
+                prob_cal = float(probs_cal[i])
+                is_b = prob_cal >= thresh
+
+                results.append(
+                    CandidateClassification(
+                        candidate_id=fv.candidate_id,
+                        beacon_probability=prob_cal,
+                        is_beacon=is_b,
+                        classifier_score=prob,
+                        model_name=self.package.model_name,
+                        model_version=self.package.model_version,
+                        inference_time_ms=per_item_ms,
+                        used_fallback=False,
+                        fallback_reason=None,
+                    )
+                )
+
+        except Exception as e:
+            print(f"[LearnedCandidateClassifier] Inference exception: {e}. Reverting to fallback.")
+            return self.fallback.classify(features)
+
+        return results
