@@ -257,7 +257,7 @@ High-resolution forensic workstation featuring executive scorecard KPIs, interac
 
 ```powershell
 # 1. Clone repository
-git clone https://github.com/Ujjwal-Qubit/Run_Time_Error.git SANKET
+git clone https://github.com/luvmangla05/ISRO_SIH_SANKET SANKET
 cd SANKET
 
 # 2. Configure Python virtual environment
