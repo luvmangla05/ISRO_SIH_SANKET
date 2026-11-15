@@ -3,6 +3,7 @@
 </p>
 
 # SANKET
+## Team Name : Run Time Terror
 
 ### AI-Assisted Virtual Camera Tracking System for Coarse Optical Alignment of Mobile Free Space Optical Communication (FSOC) Terminals
 **Smart India Hackathon 2026 | Problem Statement 26169 (Department of Space / Indian Space Research Organisation — ISRO)**
